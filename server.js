@@ -12,7 +12,6 @@
 
 const http  = require('http');
 const https = require('https');
-const net   = require('net');
 const fs    = require('fs');
 const path  = require('path');
 
@@ -204,87 +203,111 @@ function proxyHttp(req, res, targetHost, targetPath) {
 // Browser connects: ws://your-server/ws/market
 // We forward to:    wss://ws-subscriptions-clob.polymarket.com/ws/market
 function proxyWebSocket(req, socket, head) {
-  const targetPath = req.url; // /ws/market etc.
-  log('WSS', `Upgrading → ${WS_HOST}${targetPath}`);
+  const tls = require('tls');
+  const crypto = require('crypto');
+  const targetPath = req.url; // e.g. /ws/market
+  log('WSS', 'Tunneling → ' + WS_HOST + targetPath);
 
-  // Connect to Polymarket WS over TLS
-  const upstream = net.createConnection({ host: WS_HOST, port: 443 });
-
-  // We need to do the TLS handshake ourselves to get a raw socket
-  const tlsSocket = require('tls').connect({
+  // Open a TLS connection directly to Polymarket WS host
+  const upstream = tls.connect({
     host: WS_HOST,
     port: 443,
-    socket: upstream,
     rejectUnauthorized: false,
     servername: WS_HOST,
   });
 
-  tlsSocket.on('connect', () => {
-    // Forward the upgrade request to upstream with correct headers
+  upstream.on('secureConnect', () => {
+    log('WSS', 'TLS handshake OK — sending HTTP upgrade');
+
+    // Generate a proper WebSocket key
+    const wsKey = crypto.randomBytes(16).toString('base64');
+
     const upgradeReq = [
-      `GET ${targetPath} HTTP/1.1`,
-      `Host: ${WS_HOST}`,
-      `Upgrade: websocket`,
-      `Connection: Upgrade`,
-      `Sec-WebSocket-Key: ${req.headers['sec-websocket-key'] || 'dGhlIHNhbXBsZSBub25jZQ=='}`,
-      `Sec-WebSocket-Version: ${req.headers['sec-websocket-version'] || '13'}`,
-      `Origin: https://polymarket.com`,
-      `User-Agent: ${BROWSER_HEADERS['User-Agent']}`,
+      'GET ' + targetPath + ' HTTP/1.1',
+      'Host: ' + WS_HOST,
+      'Upgrade: websocket',
+      'Connection: Upgrade',
+      'Sec-WebSocket-Key: ' + wsKey,
+      'Sec-WebSocket-Version: 13',
+      'Origin: https://polymarket.com',
+      'User-Agent: ' + BROWSER_HEADERS['User-Agent'],
       '',
       '',
     ].join('\r\n');
 
-    tlsSocket.write(upgradeReq);
+    upstream.write(upgradeReq);
   });
 
-  let upgraded = false;
-  let buffer = Buffer.alloc(0);
+  let handshakeDone = false;
+  let buf = Buffer.alloc(0);
 
-  tlsSocket.on('data', (chunk) => {
-    if (!upgraded) {
-      buffer = Buffer.concat([buffer, chunk]);
-      const headerEnd = buffer.indexOf('\r\n\r\n');
-      if (headerEnd === -1) return;
+  upstream.on('data', (chunk) => {
+    if (!handshakeDone) {
+      buf = Buffer.concat([buf, chunk]);
+      const sep = buf.indexOf('\r\n\r\n');
+      if (sep === -1) return;
 
-      // Send 101 Switching Protocols back to browser
-      const responseHeaders = buffer.slice(0, headerEnd).toString();
-      const wsKey = req.headers['sec-websocket-key'];
-      const crypto = require('crypto');
-      const accept = crypto.createHash('sha1')
-        .update(wsKey + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
+      const statusLine = buf.slice(0, buf.indexOf('\r\n')).toString();
+      log('WSS', 'Upstream response: ' + statusLine);
+
+      if (!statusLine.includes('101')) {
+        log('WSS ERR', 'Upstream did not upgrade: ' + statusLine);
+        socket.destroy();
+        upstream.destroy();
+        return;
+      }
+
+      // Compute Sec-WebSocket-Accept for the BROWSER using the browser's key
+      const browserKey = req.headers['sec-websocket-key'];
+      const accept = crypto
+        .createHash('sha1')
+        .update(browserKey + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
         .digest('base64');
 
+      // Tell browser: upgrade complete
       socket.write(
         'HTTP/1.1 101 Switching Protocols\r\n' +
         'Upgrade: websocket\r\n' +
         'Connection: Upgrade\r\n' +
-        `Sec-WebSocket-Accept: ${accept}\r\n` +
+        'Sec-WebSocket-Accept: ' + accept + '\r\n' +
         '\r\n'
       );
 
-      upgraded = true;
-      // Forward any data after the headers
-      const rest = buffer.slice(headerEnd + 4);
+      handshakeDone = true;
+      log('WSS', 'Tunnel established — piping frames bidirectionally');
+
+      // Forward any WS data that came with the handshake response
+      const rest = buf.slice(sep + 4);
       if (rest.length > 0) socket.write(rest);
     } else {
-      // Pipe WS frames bidirectionally
-      socket.write(chunk);
+      // Live: pipe Polymarket → browser
+      if (socket.writable) socket.write(chunk);
     }
   });
 
-  // Browser → Polymarket
+  // Live: pipe browser → Polymarket
   socket.on('data', (chunk) => {
-    if (tlsSocket.writable) tlsSocket.write(chunk);
+    if (upstream.writable) upstream.write(chunk);
   });
 
-  tlsSocket.on('error', (e) => {
-    log('WSS ERR', e.message);
-    socket.destroy();
+  upstream.on('error', (e) => {
+    log('WSS ERR', 'Upstream: ' + e.message);
+    if (!socket.destroyed) socket.destroy();
   });
 
-  socket.on('error', () => tlsSocket.destroy());
-  socket.on('close', () => tlsSocket.destroy());
-  tlsSocket.on('close', () => socket.destroy());
+  upstream.on('close', () => {
+    log('WSS', 'Upstream closed');
+    if (!socket.destroyed) socket.destroy();
+  });
+
+  socket.on('error', (e) => {
+    log('WSS ERR', 'Browser socket: ' + e.message);
+    if (!upstream.destroyed) upstream.destroy();
+  });
+
+  socket.on('close', () => {
+    if (!upstream.destroyed) upstream.destroy();
+  });
 }
 
 // ── Status endpoint ──────────────────────────────────────────
@@ -382,10 +405,12 @@ const server = http.createServer((req, res) => {
 // WebSocket upgrade handler
 server.on('upgrade', (req, socket, head) => {
   const pathname = req.url;
+  log('UPGRADE', 'WebSocket upgrade request: ' + pathname);
   // /ws/* → ws-subscriptions-clob.polymarket.com/*
   if (pathname.startsWith('/ws/')) {
     proxyWebSocket(req, socket, head);
   } else {
+    log('UPGRADE', 'Rejected unknown WS path: ' + pathname);
     socket.destroy();
   }
 });
