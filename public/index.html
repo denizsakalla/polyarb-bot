@@ -439,6 +439,9 @@ let sseReconnectTimer = null;
 
 // ── STATE ────────────────────────────────────────────────────
 let MODE = 'demo';
+const TOKEN_PRICES = {};    // kept for renderTable compatibility
+const MARKETS = {};         // kept for compatibility
+const TOKEN_TO_MARKET = {}; // kept for compatibility
 let BOT_RUNNING = false;
 let BOT_TIMER = null;
 let ALL_OPPS = [];
@@ -612,118 +615,14 @@ function connectWS() { connectSSE(); }
 function resubscribeAll() { connectSSE(); }
 
 // ══════════════════════════════════════════════════════════════
-// ARB DETECTION — runs every 500ms on dirty flag
+// ARB DETECTION — handled server-side via SSE for cloud proxy
+// detectArb kept as no-op for compatibility
 // ══════════════════════════════════════════════════════════════
+let RENDER_DIRTY = false; // kept for compatibility
+
 function detectArb() {
-  if (!RENDER_DIRTY) return;
-  RENDER_DIRTY = false;
-
-  const opps = [];
-
-  // Binary arb: YES + NO prices should sum to ~1.00
-  // We iterate all markets that have both tokens priced
-  Object.values(MARKETS).forEach(m => {
-    const yes = TOKEN_PRICES[m.tokenYes];
-    const no  = TOKEN_PRICES[m.tokenNo];
-    if (!yes || !no) return;
-
-    const yesP = yes.bid > 0 ? yes.bid : yes.mid;
-    const noP  = no.bid > 0  ? no.bid  : no.mid;
-    if (!yesP || !noP) return;
-
-    const total = yesP + noP;
-    const spread = parseFloat(((1 - total) * 100).toFixed(2));
-    const absSp = Math.abs(spread);
-    if (absSp < 0.2) return;
-
-    opps.push({
-      id: m.id,
-      name: m.question || 'Market '+m.id,
-      cat: m.cat || 'General',
-      type: 'binary',
-      prices: [yesP, noP],
-      outcomes: m.outcomes || ['Yes','No'],
-      spread: absSp,
-      impliedTotal: parseFloat((total * 100).toFixed(1)),
-      volume: m.volume || 0,
-      slug: m.slug || '',
-      tokenYes: m.tokenYes,
-      tokenNo: m.tokenNo,
-      liveData: true
-    });
-  });
-
-  // Cross-market arb: find pairs in same category with correlated YES prices
-  const byCategory = {};
-  Object.values(MARKETS).forEach(m => {
-    const yes = TOKEN_PRICES[m.tokenYes];
-    if (!yes) return;
-    const cat = m.cat || 'General';
-    byCategory[cat] = byCategory[cat] || [];
-    byCategory[cat].push({ ...m, yesPrice: yes.bid || yes.mid });
-  });
-
-  Object.values(byCategory).forEach(mList => {
-    for (let i = 0; i < mList.length - 1 && opps.filter(o=>o.type==='cross').length < 10; i++) {
-      for (let j = i+1; j < mList.length; j++) {
-        const a = mList[i], b = mList[j];
-        const gap = Math.abs(a.yesPrice - b.yesPrice);
-        if (gap < 0.05 || gap > 0.45) continue;
-        opps.push({
-          id: a.id+'_'+b.id, type: 'cross', cat: a.cat||'General',
-          name: sh(a.question||''), nameB: sh(b.question||''),
-          priceA: a.yesPrice, priceB: b.yesPrice,
-          spread: parseFloat((gap*100).toFixed(2)),
-          volume: 0, slugA: a.slug||'', slugB: b.slug||'',
-          liveData: true
-        });
-        break;
-      }
-    }
-  });
-
-  opps.sort((a,b) => b.spread-a.spread);
-  ALL_OPPS = opps;
-  OPP_MAP = {};
-  ALL_OPPS.forEach(o => { OPP_MAP[o.id] = o; });
-
-  const above = ALL_OPPS.filter(o => o.spread >= MIN_SP);
-  document.getElementById('mOpps').textContent = above.length;
-  const sps = above.map(o=>o.spread);
-  document.getElementById('mBest').textContent = sps.length ? sps[0].toFixed(1)+'%' : '—';
-  document.getElementById('scanTime').textContent = new Date().toLocaleTimeString();
-
-  renderTable();
-
-  // If bot is running, check for auto-trades
-  if (BOT_RUNNING) autoTrade();
-}
-
-// ══════════════════════════════════════════════════════════════
-// TICKER
-// ══════════════════════════════════════════════════════════════
-const TICKER_SLOTS = {}; // tokenId -> slot index
-let tickerNext = 0;
-
-function updateTickerWith(tokenId, price) {
-  if (price <= 0 || isNaN(price)) return;
-  let slot = TICKER_SLOTS[tokenId];
-  if (slot === undefined) {
-    if (tickerNext > 4) return; // only 5 slots
-    slot = tickerNext++;
-    TICKER_SLOTS[tokenId] = slot;
-  }
-  const el = document.getElementById('t'+slot);
-  if (!el) return;
-
-  const mId = TOKEN_TO_MARKET[tokenId];
-  const m = mId ? MARKETS[mId] : null;
-  const label = m ? sh(m.question, 22) : tokenId.slice(0,10)+'…';
-  const prev = parseFloat(el.dataset.price||0);
-  const cls = price > prev ? 'tick-up' : price < prev ? 'tick-down' : 'tick-neu';
-  el.className = 'tick-item ' + cls;
-  el.dataset.price = price;
-  el.textContent = label + ' ' + (price*100).toFixed(1) + '¢';
+  // No-op: arb detection is done server-side and pushed via SSE
+  // processMarkets() handles all opportunity detection
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -737,10 +636,9 @@ function renderTable() {
   else list.sort((a,b)=>(a.name||'').localeCompare(b.name||''));
 
   if (!list.length) {
-    const hasAny = Object.keys(TOKEN_PRICES).length > 0;
-    document.getElementById('tblWrap').innerHTML = hasAny
-      ? '<div class="empty-msg">No arb above '+MIN_SP+'% — '+Object.keys(TOKEN_PRICES).length+' tokens tracked live</div>'
-      : '<div class="empty-msg"><span class="spinner" style="color:var(--green)"></span>&nbsp;Waiting for price data…</div>';
+    document.getElementById('tblWrap').innerHTML = ALL_OPPS.length > 0
+      ? '<div class="empty-msg">No arb above '+MIN_SP+'% spread currently</div>'
+      : '<div class="empty-msg"><span class="spinner" style="color:var(--green)"></span>&nbsp;Waiting for market data from server…</div>';
     return;
   }
 
