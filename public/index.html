@@ -437,6 +437,60 @@ const IS_PROXIED = window.location.protocol === 'https:' ||
 let sseSource = null;
 let sseReconnectTimer = null;
 
+// ── STATE ────────────────────────────────────────────────────
+let MODE = 'demo';
+let BOT_RUNNING = false;
+let BOT_TIMER = null;
+let ALL_OPPS = [];
+let OPP_MAP = {};
+let ACTIVE_TAB = 'all';
+let MIN_SP = 0.5;
+let PENDING_TRADE = null;
+
+// Wallet/auth
+let provider=null, signer=null;
+let WALLET_ADDR=null, FUNDER_ADDR=null;
+let API_KEY=null, API_SECRET=null, API_PASSPHRASE=null;
+let L1_DONE=false, L2_DONE=false;
+
+// Session
+let BALANCE=10000, SESSION_START=10000, PNL=0, TRADES=0;
+let HIST=[], LOG_ENTRIES=[];
+const DEMO_BALANCE=10000;
+
+// EIP-712
+const CHAIN_ID=137;
+const AUTH_DOMAIN={name:'ClobAuthDomain',version:'1',chainId:CHAIN_ID};
+const AUTH_TYPES={ClobAuth:[
+  {name:'address',type:'address'},{name:'timestamp',type:'string'},
+  {name:'nonce',type:'uint256'},{name:'message',type:'string'}
+]};
+const ORDER_DOMAIN={name:'Polymarket CTF Exchange',version:'1',chainId:CHAIN_ID,
+  verifyingContract:'0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E'};
+const ORDER_TYPES={Order:[
+  {name:'salt',type:'uint256'},{name:'maker',type:'address'},{name:'signer',type:'address'},
+  {name:'taker',type:'address'},{name:'tokenId',type:'uint256'},{name:'makerAmount',type:'uint256'},
+  {name:'takerAmount',type:'uint256'},{name:'expiration',type:'uint256'},{name:'nonce',type:'uint256'},
+  {name:'feeRateBps',type:'uint256'},{name:'side',type:'uint8'},{name:'signatureType',type:'uint8'}
+]};
+
+function loadDemoData() {
+  ALL_OPPS=[
+    {id:'d1',name:'Will the US enter a recession by end of 2025?',cat:'Economics',type:'binary',prices:[0.42,0.52],outcomes:['Yes','No'],spread:6.0,impliedTotal:94,volume:458200,slug:'us-recession-2025',tokens:null},
+    {id:'d2',name:'Bitcoin above $120k at any point in 2025?',cat:'Crypto',type:'binary',prices:[0.31,0.65],outcomes:['Yes','No'],spread:4.0,impliedTotal:96,volume:312100,slug:'btc-120k-2025',tokens:null},
+    {id:'d3',name:'Fed cuts rates in June 2025 FOMC?',cat:'Macro',type:'binary',prices:[0.55,0.48],outcomes:['Yes','No'],spread:3.0,impliedTotal:97,volume:275000,slug:'fed-june-2025',tokens:null},
+    {id:'d4',name:'S&P 500 above 6500 on Dec 31 2025?',cat:'Finance',type:'binary',prices:[0.61,0.42],outcomes:['Yes','No'],spread:3.0,impliedTotal:97,volume:210000,slug:'sp500-6500',tokens:null},
+    {id:'d5',name:'OpenAI releases GPT-5 before July 2025?',cat:'Tech',type:'binary',prices:[0.29,0.68],outcomes:['Yes','No'],spread:3.0,impliedTotal:97,volume:198000,slug:'gpt5-2025',tokens:null},
+    {id:'d6',name:'Ethereum ETF AUM exceeds $10B?',cat:'Crypto',type:'binary',prices:[0.38,0.60],outcomes:['Yes','No'],spread:2.0,impliedTotal:98,volume:145000,slug:'eth-etf-10b',tokens:null},
+    {id:'d7',name:'2025 NBA Championship winner',cat:'Sports',type:'multi',prices:[0.28,0.22,0.18,0.15,0.12],outcomes:['Celtics','Warriors','Nuggets','Bucks','Other'],spread:5.0,impliedTotal:95,volume:389000,slug:'nba-champ-2025',tokens:null},
+  ];
+  OPP_MAP={}; ALL_OPPS.forEach(o=>{OPP_MAP[o.id]=o;});
+  document.getElementById('mScan').textContent='Demo';
+  renderTable();
+  updateMetricsFromOpps();
+  log('Demo data loaded.','warn');
+}
+
 function connectSSE() {
   if (sseSource) { sseSource.close(); sseSource = null; }
   clearTimeout(sseReconnectTimer);
