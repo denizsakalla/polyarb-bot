@@ -1,0 +1,14 @@
+{
+  "name": "polyarb-cloud-proxy",
+  "version": "4.0.0",
+  "description": "PolyARB Bot cloud proxy — bypasses geo/CORS restrictions",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "dependencies": {}
+}
