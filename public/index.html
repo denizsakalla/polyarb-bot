@@ -550,13 +550,24 @@ function handleSSEMessage(msg) {
   }
 
   if (msg.type === 'opportunities' && Array.isArray(msg.data)) {
-    log('Received ' + msg.data.length + ' arb opportunities', 'ok');
+    const src = msg.source || 'server';
+    log('Got ' + msg.data.length + ' opps via ' + src, 'ok');
+    // processMarkets handles rendering
     ALL_OPPS = msg.data;
     OPP_MAP = {};
     ALL_OPPS.forEach(o => { OPP_MAP[o.id] = o; });
-    document.getElementById('mScan').textContent = ALL_OPPS.length;
+    document.getElementById('mScan').textContent = msg.data.length + ' opps';
+    document.getElementById('mScanSub').textContent = src;
+    document.getElementById('scanTime').textContent = new Date().toLocaleTimeString();
     renderTable();
     updateMetricsFromOpps();
+    // Update SSE pill to show source
+    setWsPill('live', src.split('(')[0].trim() + ' ✓');
+    return;
+  }
+
+  if (msg.type === 'status') {
+    log('Server: ' + msg.msg, 'warn');
     return;
   }
 }

@@ -1,9 +1,9 @@
 /**
- * PolyARB Cloud Proxy Server v5
- * ─────────────────────────────
- * Strategy: Server polls Polymarket HTTP APIs every 5s and streams
- * data to browser via Server-Sent Events (SSE).
- * No WebSocket tunnel needed — SSE has no CORS issues.
+ * PolyARB Cloud Proxy v6
+ * ──────────────────────
+ * Uses Goldsky public GraphQL subgraph — no auth, no geo-blocking.
+ * Falls back to Gamma API if Goldsky works.
+ * Streams data to browser via SSE every 15s.
  */
 
 const http  = require('http');
@@ -13,8 +13,11 @@ const path  = require('path');
 
 const PORT = process.env.PORT || 3000;
 
-const GAMMA_HOST = 'gamma-api.polymarket.com';
-const CLOB_HOST  = 'clob.polymarket.com';
+// Public endpoints — no API key, no geo-blocking
+const GOLDSKY_HOST = 'api.goldsky.com';
+const GOLDSKY_PATH = '/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn';
+const GAMMA_HOST   = 'gamma-api.polymarket.com';
+const CLOB_HOST    = 'clob.polymarket.com';
 
 const BROWSER_HEADERS = {
   'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -33,266 +36,294 @@ const MIME = {
 };
 
 function addCors(res) {
-  res.setHeader('Access-Control-Allow-Origin',  '*');
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS,PUT');
   res.setHeader('Access-Control-Allow-Headers',
     'Content-Type,POLY_ADDRESS,POLY_SIGNATURE,POLY_TIMESTAMP,POLY_NONCE,POLY_API_KEY,POLY_PASSPHRASE');
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 
-function ts() { return new Date().toLocaleTimeString(); }
+function ts()  { return new Date().toLocaleTimeString(); }
 function log(tag, msg) { console.log(`[${ts()}] ${tag.padEnd(8)} ${msg}`); }
 
-// ── HTTPS fetch helper ───────────────────────────────────────
-function httpsGet(hostname, urlPath, extraHeaders = {}) {
+// ── Generic HTTPS request ─────────────────────────────────────
+function httpsReq(opts, body) {
   return new Promise((resolve, reject) => {
-    const opts = {
-      hostname, port: 443, path: urlPath, method: 'GET',
-      rejectUnauthorized: false,
-      headers: { ...BROWSER_HEADERS, ...extraHeaders },
-    };
-    const req = https.request(opts, res => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        const loc = res.headers.location;
-        const u = new URL(loc.startsWith('http') ? loc : 'https://' + hostname + loc);
-        return httpsGet(u.hostname, u.pathname + u.search).then(resolve).catch(reject);
-      }
+    const req = https.request({ rejectUnauthorized: false, ...opts }, res => {
       const chunks = [];
       res.on('data', d => chunks.push(d));
       res.on('end', () => {
-        const body = Buffer.concat(chunks).toString('utf8');
-        if (res.statusCode !== 200) return reject(new Error('HTTP ' + res.statusCode + ' ' + body.slice(0,100)));
-        if (body.trim().startsWith('<')) return reject(new Error('Got HTML (blocked)'));
-        resolve(body);
+        const text = Buffer.concat(chunks).toString('utf8');
+        if (res.statusCode < 200 || res.statusCode >= 300)
+          return reject(new Error('HTTP ' + res.statusCode + ': ' + text.slice(0, 200)));
+        resolve(text);
       });
     });
     req.on('error', reject);
-    req.setTimeout(12000, () => { req.destroy(); reject(new Error('Timeout')); });
+    req.setTimeout(15000, () => { req.destroy(); reject(new Error('Timeout')); });
+    if (body) req.write(body);
     req.end();
   });
 }
 
-// ── Market data cache ────────────────────────────────────────
-let MARKETS_CACHE = [];
-let PRICES_CACHE  = {};   // tokenId -> { yes, no, spread, total }
-let lastMarketFetch = 0;
-let lastPriceFetch  = 0;
-let SSE_CLIENTS = new Set();
+// ── Goldsky GraphQL — public, no auth ────────────────────────
+async function fetchFromGoldsky() {
+  const query = `{
+    fixedProductMarketMakers(
+      first: 100
+      orderBy: scaledCollateralVolume
+      orderDirection: desc
+      where: { outcomeSlotCount: 2 }
+    ) {
+      id
+      outcomeTokenPrices
+      outcomeTokenMarginalPrices
+      scaledCollateralVolume
+      conditions { id }
+    }
+  }`;
 
-async function fetchMarkets() {
-  try {
-    const body = await httpsGet(GAMMA_HOST, '/markets?limit=100&active=true&order=volume&ascending=false');
-    const markets = JSON.parse(body);
-    if (!Array.isArray(markets)) return;
-    MARKETS_CACHE = markets;
-    lastMarketFetch = Date.now();
-    log('MARKETS', 'Fetched ' + markets.length + ' markets');
-    broadcastToClients({ type: 'markets', data: markets });
-  } catch(e) {
-    log('MARKETS', 'Failed: ' + e.message);
-  }
+  const bodyStr = JSON.stringify({ query });
+  const text = await httpsReq({
+    hostname: GOLDSKY_HOST,
+    port: 443,
+    path: GOLDSKY_PATH,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(bodyStr),
+      'User-Agent': BROWSER_HEADERS['User-Agent'],
+    },
+  }, bodyStr);
+
+  const data = JSON.parse(text);
+  if (data.errors) throw new Error(JSON.stringify(data.errors[0]));
+  return data.data.fixedProductMarketMakers || [];
 }
 
-async function fetchPrices() {
-  if (!MARKETS_CACHE.length) return;
-  // Build arb opportunities directly from market data
+// ── Gamma API ─────────────────────────────────────────────────
+async function fetchFromGamma() {
+  const text = await httpsReq({
+    hostname: GAMMA_HOST, port: 443,
+    path: '/markets?limit=100&active=true&order=volume&ascending=false',
+    method: 'GET',
+    headers: BROWSER_HEADERS,
+  });
+  if (text.trim().startsWith('<')) throw new Error('Got HTML (geo-blocked)');
+  return JSON.parse(text);
+}
+
+// ── Build arb opportunities ───────────────────────────────────
+function buildOppsFromGoldsky(makers) {
   const opps = [];
-  for (const m of MARKETS_CACHE) {
+  for (const m of makers) {
+    try {
+      let prices = m.outcomeTokenMarginalPrices || m.outcomeTokenPrices;
+      if (!prices || !Array.isArray(prices)) continue;
+      const nums = prices.map(Number).filter(n => !isNaN(n) && n > 0 && n < 1);
+      if (nums.length < 2) continue;
+      const total = nums.reduce((a, b) => a + b, 0);
+      const spread = parseFloat(((1 - total) * 100).toFixed(2));
+      if (Math.abs(spread) < 0.3) continue;
+      opps.push({
+        id: m.id,
+        name: 'Market ' + m.id.slice(0, 10) + '…',
+        cat: 'Prediction',
+        type: 'binary',
+        prices: nums,
+        outcomes: ['Yes', 'No'],
+        spread: Math.abs(spread),
+        impliedTotal: parseFloat((total * 100).toFixed(1)),
+        volume: parseFloat(m.scaledCollateralVolume || 0),
+        slug: m.id,
+        tokens: null,
+        source: 'goldsky',
+      });
+    } catch {}
+  }
+  return opps.sort((a, b) => b.spread - a.spread);
+}
+
+function buildOppsFromGamma(markets) {
+  const opps = [];
+  for (const m of markets) {
     try {
       let prices = m.outcomePrices;
       if (!prices) continue;
       if (typeof prices === 'string') prices = JSON.parse(prices);
       const nums = prices.map(Number).filter(n => !isNaN(n) && n > 0);
       if (nums.length < 2) continue;
-      const total = nums.reduce((a,b)=>a+b,0);
-      const spread = parseFloat(((1-total)*100).toFixed(2));
+      const total = nums.reduce((a, b) => a + b, 0);
+      const spread = parseFloat(((1 - total) * 100).toFixed(2));
       if (Math.abs(spread) < 0.2) continue;
-
       let outcomes = m.outcomes;
-      if (typeof outcomes === 'string') outcomes = JSON.parse(outcomes);
-
+      if (typeof outcomes === 'string') try { outcomes = JSON.parse(outcomes); } catch {}
       opps.push({
         id: m.id,
         name: m.question || m.title || 'Market',
         cat: m.category || 'General',
         type: nums.length === 2 ? 'binary' : 'multi',
         prices: nums,
-        outcomes: outcomes || ['Yes','No'],
+        outcomes: outcomes || ['Yes', 'No'],
         spread: Math.abs(spread),
-        impliedTotal: parseFloat((total*100).toFixed(1)),
+        impliedTotal: parseFloat((total * 100).toFixed(1)),
         volume: parseFloat(m.volume || 0),
         slug: m.slug || m.id || '',
         tokens: m.tokens || null,
+        source: 'gamma',
       });
     } catch {}
   }
-  opps.sort((a,b)=>b.spread-a.spread);
-  log('PRICES', 'Found ' + opps.length + ' arb opportunities from ' + MARKETS_CACHE.length + ' markets');
-  broadcastToClients({ type: 'opportunities', data: opps });
+  return opps.sort((a, b) => b.spread - a.spread);
 }
 
-function broadcastToClients(obj) {
+// ── Data cache & SSE ──────────────────────────────────────────
+let CACHED_OPPS = [];
+let DATA_SOURCE = 'none';
+let LAST_FETCH = 0;
+const SSE_CLIENTS = new Set();
+
+function broadcast(obj) {
   const msg = 'data: ' + JSON.stringify(obj) + '\n\n';
   for (const client of SSE_CLIENTS) {
     try { client.write(msg); } catch {}
   }
 }
 
-// Poll every 10s
-async function pollLoop() {
-  await fetchMarkets();
-  await fetchPrices();
-  setInterval(async () => {
-    await fetchMarkets();
-    await fetchPrices();
-  }, 10000);
+async function pollData() {
+  log('POLL', 'Fetching market data…');
+
+  // Try Gamma first (richer data with names), fall back to Goldsky
+  let opps = [];
+  let source = '';
+
+  try {
+    const markets = await fetchFromGamma();
+    opps = buildOppsFromGamma(markets);
+    source = 'Gamma API (' + markets.length + ' markets)';
+    log('GAMMA', 'OK — ' + markets.length + ' markets, ' + opps.length + ' opps');
+  } catch(e) {
+    log('GAMMA', 'Failed: ' + e.message + ' — trying Goldsky…');
+    try {
+      const makers = await fetchFromGoldsky();
+      opps = buildOppsFromGoldsky(makers);
+      source = 'Goldsky subgraph (' + makers.length + ' markets)';
+      log('GOLDSKY', 'OK — ' + makers.length + ' markets, ' + opps.length + ' opps');
+    } catch(e2) {
+      log('GOLDSKY', 'Failed: ' + e2.message);
+    }
+  }
+
+  if (opps.length > 0) {
+    CACHED_OPPS = opps;
+    DATA_SOURCE = source;
+    LAST_FETCH = Date.now();
+    broadcast({ type: 'opportunities', data: opps, source, ts: LAST_FETCH });
+    log('PUSH', 'Broadcast ' + opps.length + ' opps to ' + SSE_CLIENTS.size + ' clients via ' + source);
+  } else {
+    log('POLL', 'No opportunities found from any source');
+    broadcast({ type: 'status', msg: 'No data available — retrying…' });
+  }
 }
 
-// ── HTTP proxy (for CLOB authenticated requests) ─────────────
+// ── HTTP proxy for CLOB ───────────────────────────────────────
 function proxyHttp(req, res, targetHost, targetPath) {
-  return new Promise((resolve) => {
-    const authHeaders = {};
-    ['POLY_ADDRESS','POLY_SIGNATURE','POLY_TIMESTAMP',
-     'POLY_NONCE','POLY_API_KEY','POLY_PASSPHRASE'].forEach(h => {
-      const v = req.headers[h.toLowerCase()];
-      if (v) authHeaders[h] = v;
-    });
+  return new Promise(resolve => {
+    const authH = {};
+    ['POLY_ADDRESS','POLY_SIGNATURE','POLY_TIMESTAMP','POLY_NONCE','POLY_API_KEY','POLY_PASSPHRASE']
+      .forEach(h => { const v = req.headers[h.toLowerCase()]; if (v) authH[h] = v; });
 
     const opts = {
       hostname: targetHost, port: 443, path: targetPath,
       method: req.method, rejectUnauthorized: false,
-      headers: { ...BROWSER_HEADERS,
-        'Content-Type': req.headers['content-type'] || 'application/json',
-        ...authHeaders },
+      headers: { ...BROWSER_HEADERS, 'Content-Type': req.headers['content-type']||'application/json', ...authH },
     };
-
-    const upstream = https.request(opts, upRes => {
-      log('HTTP', upRes.statusCode + ' ← ' + targetHost + targetPath.split('?')[0]);
+    const up = https.request(opts, upRes => {
+      log('HTTP', upRes.statusCode + ' ← ' + targetHost);
       addCors(res);
-      res.writeHead(upRes.statusCode, {
-        'Content-Type': upRes.headers['content-type'] || 'application/json',
-      });
+      res.writeHead(upRes.statusCode, { 'Content-Type': upRes.headers['content-type']||'application/json' });
       upRes.pipe(res);
       upRes.on('end', resolve);
     });
-    upstream.on('error', e => {
-      addCors(res); res.writeHead(502, {'Content-Type':'application/json'});
-      res.end(JSON.stringify({error: e.message})); resolve();
-    });
-    if (['POST','PUT','DELETE'].includes(req.method)) req.pipe(upstream);
-    else upstream.end();
+    up.on('error', e => { addCors(res); res.writeHead(502); res.end(JSON.stringify({error:e.message})); resolve(); });
+    if (['POST','PUT','DELETE'].includes(req.method)) req.pipe(up); else up.end();
   });
 }
 
-// ── Static files ─────────────────────────────────────────────
-function serveStatic(res, filePath) {
-  const ext = path.extname(filePath);
-  fs.readFile(filePath, (err, data) => {
+function serveStatic(res, fp) {
+  const ext = path.extname(fp);
+  fs.readFile(fp, (err, data) => {
     if (err) { res.writeHead(404); res.end('Not found'); return; }
     addCors(res);
-    res.writeHead(200, { 'Content-Type': MIME[ext] || 'text/plain' });
+    res.writeHead(200, { 'Content-Type': MIME[ext]||'text/plain' });
     res.end(data);
   });
 }
 
-// ── Main server ───────────────────────────────────────────────
+// ── Server ────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
-  const reqUrl   = new URL(req.url, 'http://localhost');
-  const pathname = reqUrl.pathname;
-  const search   = reqUrl.search || '';
+  const u = new URL(req.url, 'http://localhost');
+  const p = u.pathname, q = u.search || '';
 
   if (req.method === 'OPTIONS') { addCors(res); res.writeHead(204); res.end(); return; }
 
-  log(req.method, pathname);
+  log(req.method, p);
 
-  // SSE stream — browser subscribes here for live data
-  if (pathname === '/stream') {
+  // SSE stream
+  if (p === '/stream') {
     addCors(res);
     res.writeHead(200, {
-      'Content-Type':  'text/event-stream',
+      'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
-      'Connection':    'keep-alive',
+      'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
     });
-    res.write('data: {"type":"connected","msg":"SSE stream connected"}\n\n');
+    res.write('data: {"type":"connected","msg":"PolyARB SSE stream ready"}\n\n');
     SSE_CLIENTS.add(res);
     log('SSE', 'Client connected. Total: ' + SSE_CLIENTS.size);
 
-    // Send current data immediately
-    if (MARKETS_CACHE.length) {
-      res.write('data: ' + JSON.stringify({type:'markets', data: MARKETS_CACHE}) + '\n\n');
+    // Send cached data immediately
+    if (CACHED_OPPS.length > 0) {
+      res.write('data: ' + JSON.stringify({ type:'opportunities', data:CACHED_OPPS, source:DATA_SOURCE, ts:LAST_FETCH }) + '\n\n');
     }
 
-    // Keepalive ping
-    const ping = setInterval(() => {
-      try { res.write(':ping\n\n'); } catch { clearInterval(ping); }
-    }, 20000);
-
-    req.on('close', () => {
-      SSE_CLIENTS.delete(res);
-      clearInterval(ping);
-      log('SSE', 'Client disconnected. Total: ' + SSE_CLIENTS.size);
-    });
+    const ping = setInterval(() => { try { res.write(':ping\n\n'); } catch { clearInterval(ping); } }, 25000);
+    req.on('close', () => { SSE_CLIENTS.delete(res); clearInterval(ping); log('SSE', 'Client left. Total: ' + SSE_CLIENTS.size); });
     return;
   }
 
   // Status
-  if (pathname === '/status' || pathname === '/health') {
-    addCors(res);
-    res.writeHead(200, {'Content-Type':'application/json'});
-    res.end(JSON.stringify({
-      status: 'ok', server: 'PolyARB Proxy v5 (SSE)',
-      uptime: Math.floor(process.uptime())+'s',
-      markets: MARKETS_CACHE.length,
-      clients: SSE_CLIENTS.size,
-      lastFetch: new Date(lastMarketFetch).toISOString(),
-    }));
-    return;
-  }
-
-  // Markets snapshot
-  if (pathname === '/markets') {
-    addCors(res);
-    res.writeHead(200, {'Content-Type':'application/json'});
-    res.end(JSON.stringify(MARKETS_CACHE));
-    return;
-  }
-
-  // Gamma proxy
-  if (pathname.startsWith('/api/gamma/')) {
-    proxyHttp(req, res, GAMMA_HOST, pathname.replace('/api/gamma','') + search);
+  if (p === '/status' || p === '/health') {
+    addCors(res); res.writeHead(200, {'Content-Type':'application/json'});
+    res.end(JSON.stringify({ status:'ok', server:'PolyARB v6 SSE', uptime:Math.floor(process.uptime())+'s',
+      opps:CACHED_OPPS.length, clients:SSE_CLIENTS.size, source:DATA_SOURCE,
+      lastFetch: LAST_FETCH ? new Date(LAST_FETCH).toISOString() : 'never' }));
     return;
   }
 
   // CLOB proxy
-  if (pathname.startsWith('/api/clob/')) {
-    proxyHttp(req, res, CLOB_HOST, pathname.replace('/api/clob','') + search);
-    return;
-  }
+  if (p.startsWith('/api/clob/')) { proxyHttp(req, res, CLOB_HOST, p.replace('/api/clob','') + q); return; }
+  // Gamma proxy (for direct browser fetches)
+  if (p.startsWith('/api/gamma/')) { proxyHttp(req, res, GAMMA_HOST, p.replace('/api/gamma','') + q); return; }
 
-  // Static files
-  const filePath = (pathname === '/' || pathname === '/index.html')
-    ? path.join(__dirname, 'public', 'index.html')
-    : path.join(__dirname, 'public', pathname);
-
-  const pub = path.resolve(__dirname, 'public');
-  if (!path.resolve(filePath).startsWith(pub)) { res.writeHead(403); res.end(); return; }
-  serveStatic(res, filePath);
+  // Static
+  const fp = (p==='/'||p==='/index.html')
+    ? path.join(__dirname,'public','index.html')
+    : path.join(__dirname,'public',p);
+  if (!path.resolve(fp).startsWith(path.resolve(__dirname,'public'))) { res.writeHead(403); res.end(); return; }
+  serveStatic(res, fp);
 });
 
 server.listen(PORT, () => {
   console.log('\n╔════════════════════════════════════════════════╗');
-  console.log('║   PolyARB Cloud Proxy v5 — SSE Edition        ║');
+  console.log('║   PolyARB Cloud Proxy v6 — SSE + Goldsky      ║');
   console.log('╚════════════════════════════════════════════════╝');
-  console.log('\n  ✓ URL:     http://localhost:' + PORT);
-  console.log('  ✓ Stream:  http://localhost:' + PORT + '/stream  (SSE)');
-  console.log('  ✓ Markets: http://localhost:' + PORT + '/markets');
-  console.log('  ✓ Status:  http://localhost:' + PORT + '/status\n');
-  pollLoop();
+  console.log('\n  ✓ URL:    http://localhost:' + PORT);
+  console.log('  ✓ Stream: http://localhost:' + PORT + '/stream');
+  console.log('  ✓ Status: http://localhost:' + PORT + '/status');
+  console.log('\n  Data: Gamma API → Goldsky subgraph (fallback)\n');
+  pollData();
+  setInterval(pollData, 15000);
 });
 
-server.on('error', e => {
-  if (e.code === 'EADDRINUSE') console.error('Port ' + PORT + ' in use.');
-  else console.error(e);
-  process.exit(1);
-});
+server.on('error', e => { console.error(e); process.exit(1); });
