@@ -281,13 +281,31 @@ function proxyWebSocket(req, socket, head) {
       if (rest.length > 0) socket.write(rest);
     } else {
       // Live: pipe Polymarket → browser
-      if (socket.writable) socket.write(chunk);
+      if (socket.writable) {
+        socket.write(chunk);
+        // Log first few messages from Polymarket
+        try {
+          const txt = chunk.toString('utf8');
+          if (txt.includes('event_type') || txt.includes('price')) {
+            log('UP→WSS', 'Polymarket sent: ' + txt.slice(0, 100));
+          }
+        } catch {}
+      }
     }
   });
 
   // Live: pipe browser → Polymarket
   socket.on('data', (chunk) => {
-    if (upstream.writable) upstream.write(chunk);
+    if (upstream.writable) {
+      upstream.write(chunk);
+      // Log first few messages from browser (subscription messages)
+      try {
+        const txt = chunk.toString('utf8');
+        if (txt.includes('assets_ids') || txt.includes('subscribe')) {
+          log('WSS→UP', 'Browser sent: ' + txt.slice(0, 120));
+        }
+      } catch {}
+    }
   });
 
   upstream.on('error', (e) => {
