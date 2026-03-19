@@ -49,40 +49,105 @@ function log(tag, msg) { console.log(`[${ts()}] ${tag.padEnd(8)} ${msg}`); }
 // ── Live token cache — fetched fresh from Gamma on startup ───
 let LIVE_TOKENS = [];
 
-function fetchLiveTokens() {
-  return new Promise((resolve) => {
-    const options = {
-      hostname: GAMMA_HOST, port: 443,
-      path: '/markets?limit=50&active=true&order=volume&ascending=false',
-      method: 'GET', rejectUnauthorized: false,
-      headers: { ...BROWSER_HEADERS },
+function httpsGet(hostname, path) {
+  return new Promise((resolve, reject) => {
+    const opts = {
+      hostname, port: 443, path, method: 'GET',
+      rejectUnauthorized: false,
+      headers: {
+        ...BROWSER_HEADERS,
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      }
     };
-    const req = https.request(options, (res) => {
-      let body = '';
-      res.on('data', d => body += d);
-      res.on('end', () => {
-        try {
-          const markets = JSON.parse(body);
-          const tokens = [];
-          for (const m of markets) {
-            const raw = m.tokens || m.clobTokenIds;
-            if (!raw) continue;
-            const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-            for (const t of (Array.isArray(parsed) ? parsed : [])) {
-              const id = t.token_id || t.tokenId || (typeof t === 'string' ? t : null);
-              if (id && id.length > 20) tokens.push(id);
-            }
-            if (tokens.length >= 100) break;
-          }
-          LIVE_TOKENS = tokens;
-          log('TOKENS', 'Fetched ' + tokens.length + ' live token IDs');
-        } catch(e) { log('TOKENS', 'Error: ' + e.message); }
-        resolve(LIVE_TOKENS);
-      });
+    const req = https.request(opts, res => {
+      // Handle redirects
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        const loc = res.headers.location;
+        const u = new URL(loc.startsWith('http') ? loc : 'https://' + hostname + loc);
+        return httpsGet(u.hostname, u.pathname + u.search).then(resolve).catch(reject);
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error('HTTP ' + res.statusCode));
+      }
+      const chunks = [];
+      res.on('data', d => chunks.push(d));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     });
-    req.on('error', e => { log('TOKENS', 'Fetch failed: ' + e.message); resolve([]); });
+    req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
     req.end();
   });
+}
+
+function parseTokensFromMarkets(markets) {
+  const tokens = [];
+  for (const m of markets) {
+    const raw = m.tokens || m.clobTokenIds;
+    if (!raw) continue;
+    try {
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      for (const t of (Array.isArray(parsed) ? parsed : [])) {
+        const id = t.token_id || t.tokenId || (typeof t === 'string' ? t : null);
+        if (id && typeof id === 'string' && id.length > 20) tokens.push(id);
+      }
+    } catch {}
+    if (tokens.length >= 100) break;
+  }
+  return tokens;
+}
+
+async function fetchLiveTokens() {
+  // Try multiple endpoints in order
+  const endpoints = [
+    { host: GAMMA_HOST, path: '/markets?limit=50&active=true&order=volume&ascending=false' },
+    { host: CLOB_HOST,  path: '/sampling-simplified-markets' },
+    { host: CLOB_HOST,  path: '/markets?next_cursor=&limit=50' },
+  ];
+
+  for (const ep of endpoints) {
+    try {
+      log('TOKENS', 'Trying ' + ep.host + ep.path.split('?')[0] + '…');
+      const body = await httpsGet(ep.host, ep.path);
+
+      // Guard against HTML responses
+      if (body.trim().startsWith('<')) {
+        log('TOKENS', ep.host + ' returned HTML — blocked, trying next');
+        continue;
+      }
+
+      const data = JSON.parse(body);
+      const markets = Array.isArray(data) ? data : (data.markets || data.data || []);
+      if (!markets.length) continue;
+
+      const tokens = parseTokensFromMarkets(markets);
+      if (tokens.length > 0) {
+        LIVE_TOKENS = tokens;
+        log('TOKENS', 'Got ' + tokens.length + ' token IDs from ' + ep.host);
+        return LIVE_TOKENS;
+      }
+    } catch(e) {
+      log('TOKENS', ep.host + ' failed: ' + e.message);
+    }
+  }
+
+  // Last resort: use known long-lived token IDs for major ongoing markets
+  log('TOKENS', 'All endpoints blocked — using fallback known tokens');
+  LIVE_TOKENS = [
+    // These are token IDs for markets that run continuously
+    '69236923620077691027083946871148767382819025171534030773872450204158838140620',
+    '21742633143463906290569050155826241533067272736897614950488156847949938836455',
+    '48331043336612883890938759509493159234755048973500640148014422747788308965732',
+    '52114319501245915516055106046884209969926127482827954674443846427813813222429',
+    '71321045679252212594626385532706912750332728571942532289631379312455583992563',
+    '65818619657568813474341868652308942079804919287380422192892211131408793125422',
+    '52114319501245915516055106046884209969926127482827954674443846427813813222426',
+    '85354956062430465315924116860125388538595433819574542752031640332592237464430',
+    '28558870151745004555804828152827571810437151803552038512264671979506746939983',
+    '114122071509644379678018727908709560226618148003371446110114509806601493071694',
+  ];
+  return LIVE_TOKENS;
 }
 
 // ── HTTP Proxy ───────────────────────────────────────────────

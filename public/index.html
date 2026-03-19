@@ -426,27 +426,35 @@ select:focus,input:focus{border-color:var(--green)}
 //  POLYMARKET WEBSOCKET — no CORS, works directly in browser
 // ══════════════════════════════════════════════════════════════
 // Auto-detect: if served from cloud proxy, use it; else try direct
-const IS_PROXIED = window.location.hostname !== '' && 
-                   window.location.hostname !== 'localhost' ||
-                   window.location.port === '3000' ||
-                   window.location.port === '3001';
+// Detect if running via cloud proxy server (not opened as local file)
+const IS_PROXIED = (
+  window.location.protocol === 'https:' ||
+  window.location.hostname === 'localhost' ||
+  window.location.port === '3000' ||
+  window.location.port === '3001'
+) && window.location.hostname !== '';
 
-const _proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 const _host  = window.location.host;
+const _wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 
-// WebSocket: use proxy /ws/ path if available, else direct (blocked by geo)
-const WS_URL   = IS_PROXIED 
-  ? `${_proto}//${_host}/ws/market`
+// Debug: log what was detected
+console.log('[PolyARB] IS_PROXIED:', IS_PROXIED, '| protocol:', window.location.protocol, '| host:', window.location.hostname, '| port:', window.location.port);
+
+// WebSocket: via proxy tunnel if on server, else direct
+const WS_URL = IS_PROXIED
+  ? (_wsProto + '//' + _host + '/ws/market')
   : 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
 
-// CLOB: use proxy /api/clob/ path if available, else direct
+console.log('[PolyARB] WS_URL will be:', IS_PROXIED ? (_wsProto + '//' + _host + '/ws/market') : 'wss://ws-subscriptions-clob.polymarket.com/ws/market');
+
+// CLOB API via proxy
 const CLOB_URL = IS_PROXIED
-  ? `${window.location.protocol}//${_host}/api/clob`
+  ? (window.location.protocol + '//' + _host + '/api/clob')
   : 'https://clob.polymarket.com';
 
-// Gamma: use proxy /api/gamma/ path if available, else direct
+// Gamma API via proxy
 const GAMMA_URL_PROXIED = IS_PROXIED
-  ? `${window.location.protocol}//${_host}/api/gamma`
+  ? (window.location.protocol + '//' + _host + '/api/gamma')
   : 'https://gamma-api.polymarket.com';
 
 // Token IDs loaded dynamically from the proxy server's /tokens endpoint
@@ -457,18 +465,34 @@ let DYNAMIC_TOKEN_IDS = [];
 async function loadLiveTokens() {
   try {
     const base = (typeof IS_PROXIED !== 'undefined' && IS_PROXIED)
-      ? window.location.origin
-      : null;
-    if (!base) return;
+      ? window.location.origin : null;
+    if (!base) { log('Not on cloud server — using WebSocket direct', 'warn'); return; }
+
+    // First try to get full market data (richer info)
+    const marketOk = await loadLiveMarkets(base);
+    if (marketOk) return;
+
+    // Fall back to raw token IDs from /tokens
+    log('Trying /tokens endpoint for raw IDs…', 'info');
     const r = await fetch(base + '/tokens');
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
     DYNAMIC_TOKEN_IDS = d.tokens || [];
-    log('Loaded ' + DYNAMIC_TOKEN_IDS.length + ' live token IDs from server', 'ok');
-    // Also fetch full market data for context
-    await loadLiveMarkets(base);
+    if (DYNAMIC_TOKEN_IDS.length > 0) {
+      log('Got ' + DYNAMIC_TOKEN_IDS.length + ' token IDs — subscribing to WebSocket', 'ok');
+      // Build minimal market entries from token pairs
+      for (let i = 0; i < DYNAMIC_TOKEN_IDS.length - 1; i += 2) {
+        const id = 'tok_' + i;
+        SEED_MARKETS.push({
+          id, question: 'Market ' + (i/2 + 1), cat: 'General',
+          tokenYes: DYNAMIC_TOKEN_IDS[i], tokenNo: DYNAMIC_TOKEN_IDS[i+1],
+          outcomes: ['Yes','No'], slug: '', volume: 0
+        });
+      }
+      log('Built ' + SEED_MARKETS.length + ' market entries from token IDs', 'ok');
+    }
   } catch(e) {
-    log('Could not load live tokens: ' + e.message, 'warn');
+    log('Token load error: ' + e.message + ' — WebSocket will still connect', 'warn');
   }
 }
 
@@ -476,7 +500,10 @@ async function loadLiveMarkets(base) {
   try {
     const r = await fetch(base + '/api/gamma/markets?limit=50&active=true&order=volume&ascending=false');
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    const markets = await r.json();
+    const text = await r.text();
+    if (text.trim().startsWith('<')) throw new Error('Got HTML — API blocked');
+    const markets = JSON.parse(text);
+    if (!Array.isArray(markets) || markets.length === 0) throw new Error('Empty response');
     SEED_MARKETS = [];
     for (const m of markets) {
       const raw = m.tokens || m.clobTokenIds;
@@ -501,8 +528,10 @@ async function loadLiveMarkets(base) {
     document.getElementById('mScan').textContent = SEED_MARKETS.length;
     // Re-subscribe with fresh markets
     if (ws && ws.readyState === WebSocket.OPEN) subscribeSeeds();
+    return true;
   } catch(e) {
-    log('Market load error: ' + e.message, 'warn');
+    log('Market load: ' + e.message, 'warn');
+    return false;
   }
 }
 
@@ -566,7 +595,8 @@ function connectWS() {
   clearTimeout(wsReconnectTimer);
 
   setWsPill('connecting', 'Connecting…');
-  log('Connecting to Polymarket WebSocket…', 'ws');
+  log('WS URL: ' + WS_URL, 'ws');
+  log('IS_PROXIED: ' + IS_PROXIED + ' | host: ' + window.location.hostname, 'info');
 
   ws = new WebSocket(WS_URL);
 
