@@ -449,26 +449,62 @@ const GAMMA_URL_PROXIED = IS_PROXIED
   ? `${window.location.protocol}//${_host}/api/gamma`
   : 'https://gamma-api.polymarket.com';
 
-// Top markets to seed: hardcoded popular token IDs from Polymarket
-// These are the YES token IDs for major binary markets
-// The bot will also discover new markets from the WS 'new_market' events
-const SEED_MARKETS = [
-  { id:'seed1', question:'BTC above $100k end of 2025?', cat:'Crypto',
-    tokenYes:'71321045679252212594626385532706912750332728571942532289631379312455583992563',
-    tokenNo: '52114319501245915516055106046884209969926127482827954674443846427813813222429' },
-  { id:'seed2', question:'ETH above $5k end of 2025?', cat:'Crypto',
-    tokenYes:'16678291189211314787145083999015737376658799626183230671758641503291735614088',
-    tokenNo: '51981842696737342756700954335372624874870969986174590276476872965567879097' },
-  { id:'seed3', question:'Fed rate cut in 2025?', cat:'Macro',
-    tokenYes:'65818619657568813474341868652308942079804919287380422192892211131408793125422',
-    tokenNo: '52114319501245915516055106046884209969926127482827954674443846427813813222426' },
-  { id:'seed4', question:'US recession by end 2025?', cat:'Economics',
-    tokenYes:'85354956062430465315924116860125388538595433819574542752031640332592237464430',
-    tokenNo: '28558870151745004555804828152827571810437151803552038512264671979506746939983' },
-  { id:'seed5', question:'S&P 500 above 6000 EOY 2025?', cat:'Finance',
-    tokenYes:'114122071509644379678018727908709560226618148003371446110114509806601493071694',
-    tokenNo: '72323426831255174172072802022736890507043564673937437368765543661879882836461' },
-];
+// Token IDs loaded dynamically from the proxy server's /tokens endpoint
+// Falls back to empty array if server isn't available
+let SEED_MARKETS = [];
+let DYNAMIC_TOKEN_IDS = [];
+
+async function loadLiveTokens() {
+  try {
+    const base = (typeof IS_PROXIED !== 'undefined' && IS_PROXIED)
+      ? window.location.origin
+      : null;
+    if (!base) return;
+    const r = await fetch(base + '/tokens');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    DYNAMIC_TOKEN_IDS = d.tokens || [];
+    log('Loaded ' + DYNAMIC_TOKEN_IDS.length + ' live token IDs from server', 'ok');
+    // Also fetch full market data for context
+    await loadLiveMarkets(base);
+  } catch(e) {
+    log('Could not load live tokens: ' + e.message, 'warn');
+  }
+}
+
+async function loadLiveMarkets(base) {
+  try {
+    const r = await fetch(base + '/api/gamma/markets?limit=50&active=true&order=volume&ascending=false');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const markets = await r.json();
+    SEED_MARKETS = [];
+    for (const m of markets) {
+      const raw = m.tokens || m.clobTokenIds;
+      if (!raw) continue;
+      const toks = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!Array.isArray(toks) || toks.length < 2) continue;
+      const yesId = toks[0].token_id || toks[0].tokenId || toks[0];
+      const noId  = toks[1].token_id || toks[1].tokenId || toks[1];
+      if (!yesId || !noId) continue;
+      SEED_MARKETS.push({
+        id: 'live_' + m.id,
+        question: m.question || m.title || 'Market',
+        cat: m.category || 'General',
+        tokenYes: yesId,
+        tokenNo: noId,
+        slug: m.slug || '',
+        volume: parseFloat(m.volume || 0),
+        outcomes: ['Yes', 'No']
+      });
+    }
+    log('Loaded ' + SEED_MARKETS.length + ' live markets for subscription', 'ok');
+    document.getElementById('mScan').textContent = SEED_MARKETS.length;
+    // Re-subscribe with fresh markets
+    if (ws && ws.readyState === WebSocket.OPEN) subscribeSeeds();
+  } catch(e) {
+    log('Market load error: ' + e.message, 'warn');
+  }
+}
 
 // ══════════════════════════════════════════════════════════════
 // STATE
@@ -574,19 +610,33 @@ function connectWS() {
 }
 
 function subscribeSeeds() {
-  // Register seed markets in our data store
+  if (SEED_MARKETS.length === 0) {
+    log('No markets loaded yet — waiting for live data from server', 'warn');
+    // Try loading live markets if we have a server
+    if (typeof IS_PROXIED !== 'undefined' && IS_PROXIED) {
+      loadLiveMarkets(window.location.origin).then(() => {
+        if (SEED_MARKETS.length > 0) subscribeSeeds();
+      });
+    }
+    return;
+  }
+
+  // Register markets in our data store
   SEED_MARKETS.forEach(m => {
     MARKETS[m.id] = { ...m, prices: {}, bestBid: null, bestAsk: null };
-    TOKEN_TO_MARKET[m.tokenYes] = m.id;
-    TOKEN_TO_MARKET[m.tokenNo]  = m.id;
+    if (m.tokenYes) TOKEN_TO_MARKET[m.tokenYes] = m.id;
+    if (m.tokenNo)  TOKEN_TO_MARKET[m.tokenNo]  = m.id;
   });
 
-  // Subscribe to all seed token IDs
-  const allTokenIds = SEED_MARKETS.flatMap(m => [m.tokenYes, m.tokenNo]);
-  const msg = { assets_ids: allTokenIds, type: 'market' };
-  ws.send(JSON.stringify(msg));
-  log('Subscribed to ' + SEED_MARKETS.length + ' seed markets (' + allTokenIds.length + ' tokens)', 'ws');
-  document.getElementById('mScan').textContent = Object.keys(MARKETS).length;
+  // Subscribe in batches of 50 (WS limit)
+  const allTokenIds = SEED_MARKETS.flatMap(m => [m.tokenYes, m.tokenNo].filter(Boolean));
+  const BATCH = 50;
+  for (let i = 0; i < allTokenIds.length; i += BATCH) {
+    const batch = allTokenIds.slice(i, i + BATCH);
+    ws.send(JSON.stringify({ assets_ids: batch, type: 'market' }));
+  }
+  log('Subscribed to ' + SEED_MARKETS.length + ' markets (' + allTokenIds.length + ' tokens)', 'ws');
+  document.getElementById('mScan').textContent = SEED_MARKETS.length;
 }
 
 function subscribeToMarket(market) {
@@ -1214,15 +1264,19 @@ function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').
 updateMetrics(); updateSLBar(); recalc();
 setMode('demo');
 
-// Start WebSocket connection
-connectWS();
+// Load live markets from server FIRST, then connect WebSocket
+log('PolyARB Bot v4 — loading live market data…', 'ok');
+loadLiveTokens().then(() => {
+  // Start WebSocket after we have fresh token IDs
+  connectWS();
+  log('WebSocket connecting with ' + SEED_MARKETS.length + ' live markets', 'ws');
+}).catch(() => {
+  // Still connect WS even if token load failed
+  connectWS();
+});
 
 // Run arb detection loop every 500ms
 setInterval(detectArb, 500);
-
-log('WebSocket arb engine starting…', 'ok');
-log('Connecting to wss://ws-subscriptions-clob.polymarket.com', 'ws');
-log('Auto-detecting best data source for your location…', 'info');
 </script>
 </body>
 </html>

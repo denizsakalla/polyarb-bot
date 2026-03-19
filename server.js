@@ -46,6 +46,45 @@ function addCors(res) {
 function ts() { return new Date().toLocaleTimeString(); }
 function log(tag, msg) { console.log(`[${ts()}] ${tag.padEnd(8)} ${msg}`); }
 
+// ── Live token cache — fetched fresh from Gamma on startup ───
+let LIVE_TOKENS = [];
+
+function fetchLiveTokens() {
+  return new Promise((resolve) => {
+    const options = {
+      hostname: GAMMA_HOST, port: 443,
+      path: '/markets?limit=50&active=true&order=volume&ascending=false',
+      method: 'GET', rejectUnauthorized: false,
+      headers: { ...BROWSER_HEADERS },
+    };
+    const req = https.request(options, (res) => {
+      let body = '';
+      res.on('data', d => body += d);
+      res.on('end', () => {
+        try {
+          const markets = JSON.parse(body);
+          const tokens = [];
+          for (const m of markets) {
+            const raw = m.tokens || m.clobTokenIds;
+            if (!raw) continue;
+            const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            for (const t of (Array.isArray(parsed) ? parsed : [])) {
+              const id = t.token_id || t.tokenId || (typeof t === 'string' ? t : null);
+              if (id && id.length > 20) tokens.push(id);
+            }
+            if (tokens.length >= 100) break;
+          }
+          LIVE_TOKENS = tokens;
+          log('TOKENS', 'Fetched ' + tokens.length + ' live token IDs');
+        } catch(e) { log('TOKENS', 'Error: ' + e.message); }
+        resolve(LIVE_TOKENS);
+      });
+    });
+    req.on('error', e => { log('TOKENS', 'Fetch failed: ' + e.message); resolve([]); });
+    req.end();
+  });
+}
+
 // ── HTTP Proxy ───────────────────────────────────────────────
 function proxyHttp(req, res, targetHost, targetPath) {
   return new Promise((resolve) => {
@@ -238,6 +277,14 @@ const server = http.createServer((req, res) => {
   // Status
   if (pathname === '/status' || pathname === '/health') { serveStatus(res); return; }
 
+  // Live token IDs endpoint — used by bot to subscribe to fresh markets
+  if (pathname === '/tokens') {
+    addCors(res);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ tokens: LIVE_TOKENS, count: LIVE_TOKENS.length, ts: Date.now() }));
+    return;
+  }
+
   // Gamma API proxy: /api/gamma/* → gamma-api.polymarket.com/*
   if (pathname.startsWith('/api/gamma/')) {
     const up = pathname.replace('/api/gamma', '') + search;
@@ -276,6 +323,11 @@ server.on('upgrade', (req, socket, head) => {
   } else {
     socket.destroy();
   }
+});
+
+// Fetch live tokens before starting
+fetchLiveTokens().then(() => {
+  setInterval(fetchLiveTokens, 10 * 60 * 1000); // refresh every 10 min
 });
 
 server.listen(PORT, () => {
