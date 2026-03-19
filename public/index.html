@@ -265,7 +265,7 @@ select:focus,input:focus{border-color:var(--green)}
   <div class="topbar">
     <div class="brand">
       <h1>Poly<em>ARB</em> Bot <span style="font-size:11px;color:var(--text3);font-weight:400">v4</span></h1>
-      <p>Live WebSocket feed · Real Polymarket data · No server required</p>
+      <p>Live SSE feed · Real Polymarket data · Cloud proxy</p>
     </div>
     <div class="topbar-right">
       <div class="bst"><div class="bdot" id="bdot"></div><span id="bstlbl">Idle</span></div>
@@ -423,363 +423,139 @@ select:focus,input:focus{border-color:var(--green)}
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/5.7.2/ethers.umd.min.js"></script>
 <script>
 // ══════════════════════════════════════════════════════════════
-//  POLYMARKET WEBSOCKET — no CORS, works directly in browser
+//  DATA ENGINE — Server-Sent Events from cloud proxy
+//  Server polls Polymarket every 10s, pushes data via SSE
 // ══════════════════════════════════════════════════════════════
-// Auto-detect: if served from cloud proxy, use it; else try direct
-// Detect if running via cloud proxy server (not opened as local file)
-const IS_PROXIED = (
-  window.location.protocol === 'https:' ||
-  window.location.hostname === 'localhost' ||
-  window.location.port === '3000' ||
-  window.location.port === '3001'
-) && window.location.hostname !== '';
-
-const _host  = window.location.host;
-const _wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-
-// Debug: log what was detected
-console.log('[PolyARB] IS_PROXIED:', IS_PROXIED, '| protocol:', window.location.protocol, '| host:', window.location.hostname, '| port:', window.location.port);
-
-// WebSocket: via proxy tunnel if on server, else direct
-const WS_URL = IS_PROXIED
-  ? (_wsProto + '//' + _host + '/ws/market')
-  : 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
-
-console.log('[PolyARB] WS_URL will be:', IS_PROXIED ? (_wsProto + '//' + _host + '/ws/market') : 'wss://ws-subscriptions-clob.polymarket.com/ws/market');
-
-// CLOB API via proxy
-const CLOB_URL = IS_PROXIED
-  ? (window.location.protocol + '//' + _host + '/api/clob')
+const CLOB_URL = (window.location.protocol === 'https:' || window.location.hostname === 'localhost')
+  ? (window.location.protocol + '//' + window.location.host + '/api/clob')
   : 'https://clob.polymarket.com';
 
-// Gamma API via proxy
-const GAMMA_URL_PROXIED = IS_PROXIED
-  ? (window.location.protocol + '//' + _host + '/api/gamma')
-  : 'https://gamma-api.polymarket.com';
+const IS_PROXIED = window.location.protocol === 'https:' || 
+                   window.location.hostname === 'localhost' ||
+                   window.location.port === '3000';
 
-// Token IDs loaded dynamically from the proxy server's /tokens endpoint
-// Falls back to empty array if server isn't available
-let SEED_MARKETS = [];
-let DYNAMIC_TOKEN_IDS = [];
+let sseSource = null;
+let sseReconnectTimer = null;
 
-async function loadLiveTokens() {
-  try {
-    const base = (typeof IS_PROXIED !== 'undefined' && IS_PROXIED)
-      ? window.location.origin : null;
-    if (!base) { log('Not on cloud server — using WebSocket direct', 'warn'); return; }
+function connectSSE() {
+  if (sseSource) { sseSource.close(); sseSource = null; }
+  clearTimeout(sseReconnectTimer);
 
-    // First try to get full market data (richer info)
-    const marketOk = await loadLiveMarkets(base);
-    if (marketOk) return;
-
-    // Fall back to raw token IDs from /tokens
-    log('Trying /tokens endpoint for raw IDs…', 'info');
-    const r = await fetch(base + '/tokens');
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const d = await r.json();
-    DYNAMIC_TOKEN_IDS = d.tokens || [];
-    if (DYNAMIC_TOKEN_IDS.length > 0) {
-      log('Got ' + DYNAMIC_TOKEN_IDS.length + ' token IDs — subscribing to WebSocket', 'ok');
-      // Build minimal market entries from token pairs
-      for (let i = 0; i < DYNAMIC_TOKEN_IDS.length - 1; i += 2) {
-        const id = 'tok_' + i;
-        SEED_MARKETS.push({
-          id, question: 'Market ' + (i/2 + 1), cat: 'General',
-          tokenYes: DYNAMIC_TOKEN_IDS[i], tokenNo: DYNAMIC_TOKEN_IDS[i+1],
-          outcomes: ['Yes','No'], slug: '', volume: 0
-        });
-      }
-      log('Built ' + SEED_MARKETS.length + ' market entries from token IDs', 'ok');
-    }
-  } catch(e) {
-    log('Token load error: ' + e.message + ' — WebSocket will still connect', 'warn');
-  }
-}
-
-async function loadLiveMarkets(base) {
-  try {
-    const r = await fetch(base + '/api/gamma/markets?limit=50&active=true&order=volume&ascending=false');
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const text = await r.text();
-    if (text.trim().startsWith('<')) throw new Error('Got HTML — API blocked');
-    const markets = JSON.parse(text);
-    if (!Array.isArray(markets) || markets.length === 0) throw new Error('Empty response');
-    SEED_MARKETS = [];
-    for (const m of markets) {
-      const raw = m.tokens || m.clobTokenIds;
-      if (!raw) continue;
-      const toks = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      if (!Array.isArray(toks) || toks.length < 2) continue;
-      const yesId = toks[0].token_id || toks[0].tokenId || toks[0];
-      const noId  = toks[1].token_id || toks[1].tokenId || toks[1];
-      if (!yesId || !noId) continue;
-      SEED_MARKETS.push({
-        id: 'live_' + m.id,
-        question: m.question || m.title || 'Market',
-        cat: m.category || 'General',
-        tokenYes: yesId,
-        tokenNo: noId,
-        slug: m.slug || '',
-        volume: parseFloat(m.volume || 0),
-        outcomes: ['Yes', 'No']
-      });
-    }
-    log('Loaded ' + SEED_MARKETS.length + ' live markets for subscription', 'ok');
-    document.getElementById('mScan').textContent = SEED_MARKETS.length;
-    // Re-subscribe with fresh markets
-    if (ws && ws.readyState === WebSocket.OPEN) subscribeSeeds();
-    return true;
-  } catch(e) {
-    log('Market load: ' + e.message, 'warn');
-    return false;
-  }
-}
-
-// ══════════════════════════════════════════════════════════════
-// STATE
-// ══════════════════════════════════════════════════════════════
-let ws = null;
-let wsReconnectTimer = null;
-let wsPingTimer = null;
-let MODE = 'demo';
-let BOT_RUNNING = false;
-let BOT_TIMER = null;
-
-// Market data store — keyed by token ID
-// { tokenId -> { price, side, market_id, question, ... } }
-const TOKEN_PRICES = {};
-// Market store — keyed by market condition ID
-const MARKETS = {};
-// Token → market mapping
-const TOKEN_TO_MARKET = {};
-// Opportunities detected
-let ALL_OPPS = [];
-let OPP_MAP = {};
-let ACTIVE_TAB = 'all';
-let MIN_SP = 0.5;
-let PENDING_TRADE = null;
-let RENDER_DIRTY = false;
-
-// Wallet/auth
-let provider=null, signer=null;
-let WALLET_ADDR=null, FUNDER_ADDR=null;
-let API_KEY=null, API_SECRET=null, API_PASSPHRASE=null;
-let L1_DONE=false, L2_DONE=false;
-
-// Session
-let BALANCE=10000, SESSION_START=10000, PNL=0, TRADES=0;
-let HIST=[], LOG_ENTRIES=[];
-const DEMO_BALANCE=10000;
-
-// EIP-712
-const CHAIN_ID=137;
-const AUTH_DOMAIN={name:'ClobAuthDomain',version:'1',chainId:CHAIN_ID};
-const AUTH_TYPES={ClobAuth:[
-  {name:'address',type:'address'},{name:'timestamp',type:'string'},
-  {name:'nonce',type:'uint256'},{name:'message',type:'string'}
-]};
-const ORDER_DOMAIN={name:'Polymarket CTF Exchange',version:'1',chainId:CHAIN_ID,
-  verifyingContract:'0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E'};
-const ORDER_TYPES={Order:[
-  {name:'salt',type:'uint256'},{name:'maker',type:'address'},{name:'signer',type:'address'},
-  {name:'taker',type:'address'},{name:'tokenId',type:'uint256'},{name:'makerAmount',type:'uint256'},
-  {name:'takerAmount',type:'uint256'},{name:'expiration',type:'uint256'},{name:'nonce',type:'uint256'},
-  {name:'feeRateBps',type:'uint256'},{name:'side',type:'uint8'},{name:'signatureType',type:'uint8'}
-]};
-
-// ══════════════════════════════════════════════════════════════
-// WEBSOCKET ENGINE
-// ══════════════════════════════════════════════════════════════
-function connectWS() {
-  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
-  clearTimeout(wsReconnectTimer);
-
-  setWsPill('connecting', 'Connecting…');
-  log('WS URL: ' + WS_URL, 'ws');
-  log('IS_PROXIED: ' + IS_PROXIED + ' | host: ' + window.location.hostname, 'info');
-
-  ws = new WebSocket(WS_URL);
-
-  ws.onopen = () => {
-    setWsPill('live', 'Live ✓');
-    log('WebSocket connected — live data streaming', 'ok');
-    document.getElementById('bnrWs').className = 'banner ok';
-    document.getElementById('bnrWsText').textContent = 'WebSocket connected — receiving live Polymarket prices';
-
-    // Subscribe to seed markets — with small delay to ensure tunnel is ready
-    setTimeout(() => {
-      log('Sending subscription to ' + SEED_MARKETS.length + ' markets…', 'ws');
-      subscribeSeeds();
-    }, 500);
-
-    // Re-subscribe after 3s in case first message was dropped
-    setTimeout(() => {
-      if (Object.keys(TOKEN_PRICES).length === 0) {
-        log('No prices yet — re-sending subscription…', 'warn');
-        subscribeSeeds();
-      }
-    }, 4000);
-
-    // Ping every 10s to keep alive
-    clearInterval(wsPingTimer);
-    wsPingTimer = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) ws.send('{}');
-    }, 10000);
-  };
-
-  ws.onmessage = (e) => {
-    if (!e.data || e.data === '{}') return; // pong
-    try {
-      const msg = JSON.parse(e.data);
-      // Log first few messages so we can see what's coming through
-      if (LOG_ENTRIES.length < 20) {
-        log('WS MSG: ' + (msg.event_type || JSON.stringify(msg).slice(0, 80)), 'ws');
-      }
-      handleWSMessage(msg);
-    } catch(err) {
-      log('WS parse error: ' + err.message + ' raw: ' + String(e.data).slice(0, 60), 'err');
-    }
-  };
-
-  ws.onerror = (e) => {
-    log('WebSocket error — will reconnect in 5s', 'err');
-    setWsPill('error', 'Error');
-  };
-
-  ws.onclose = () => {
-    clearInterval(wsPingTimer);
-    setWsPill('connecting', 'Reconnecting…');
-    log('WebSocket closed — reconnecting in 5s…', 'warn');
-    document.getElementById('bnrWs').className = 'banner warn';
-    document.getElementById('bnrWsText').textContent = 'WebSocket disconnected — reconnecting…';
-    wsReconnectTimer = setTimeout(connectWS, 5000);
-  };
-}
-
-function subscribeSeeds() {
-  if (SEED_MARKETS.length === 0) {
-    log('No markets loaded yet — waiting for live data from server', 'warn');
-    // Try loading live markets if we have a server
-    if (typeof IS_PROXIED !== 'undefined' && IS_PROXIED) {
-      loadLiveMarkets(window.location.origin).then(() => {
-        if (SEED_MARKETS.length > 0) subscribeSeeds();
-      });
-    }
+  if (!IS_PROXIED) {
+    log('Not on proxy server — SSE unavailable. Using demo data.', 'warn');
+    setWsPill('error', 'No proxy');
+    loadDemoData();
     return;
   }
 
-  // Register markets in our data store
-  SEED_MARKETS.forEach(m => {
-    MARKETS[m.id] = { ...m, prices: {}, bestBid: null, bestAsk: null };
-    if (m.tokenYes) TOKEN_TO_MARKET[m.tokenYes] = m.id;
-    if (m.tokenNo)  TOKEN_TO_MARKET[m.tokenNo]  = m.id;
-  });
+  const sseUrl = window.location.protocol + '//' + window.location.host + '/stream';
+  log('Connecting to SSE stream: ' + sseUrl, 'ws');
+  setWsPill('connecting', 'Connecting…');
 
-  // Subscribe in batches of 50 (WS limit)
-  const allTokenIds = SEED_MARKETS.flatMap(m => [m.tokenYes, m.tokenNo].filter(Boolean));
-  const BATCH = 50;
-  for (let i = 0; i < allTokenIds.length; i += BATCH) {
-    const batch = allTokenIds.slice(i, i + BATCH);
-    const msg = JSON.stringify({ assets_ids: batch, type: 'market' });
-    ws.send(msg);
-    log('Sent subscription batch ' + (i/BATCH+1) + ': ' + batch.length + ' tokens', 'ws');
-  }
-  log('Total subscribed: ' + SEED_MARKETS.length + ' markets, ' + allTokenIds.length + ' tokens', 'ok');
-  document.getElementById('mScan').textContent = SEED_MARKETS.length;
-}
+  sseSource = new EventSource(sseUrl);
 
-function subscribeToMarket(market) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const tokens = market.assets_ids || [];
-  if (!tokens.length) return;
-  ws.send(JSON.stringify({ operation: 'subscribe', assets_ids: tokens }));
-}
+  sseSource.onopen = () => {
+    setWsPill('live', 'Live ✓');
+    log('SSE stream connected — receiving live Polymarket data', 'ok');
+    document.getElementById('bnrWs').className = 'banner ok';
+    document.getElementById('bnrWsText').textContent = 'SSE connected — live Polymarket market data streaming';
+  };
 
-function resubscribeAll() {
-  if (!ws || ws.readyState !== WebSocket.OPEN) { connectWS(); return; }
-  subscribeSeeds();
-  log('Resynced all subscriptions', 'ws');
-}
-
-// ══════════════════════════════════════════════════════════════
-// WEBSOCKET MESSAGE HANDLER
-// ══════════════════════════════════════════════════════════════
-function handleWSMessage(msg) {
-  const et = msg.event_type;
-
-  if (et === 'best_bid_ask') {
-    // Direct best bid/ask update — most useful for arb detection
-    const tokenId = msg.asset_id;
-    const bid = parseFloat(msg.best_bid || 0);
-    const ask = parseFloat(msg.best_ask || 0);
-    if (!tokenId || isNaN(bid) || isNaN(ask)) return;
-
-    TOKEN_PRICES[tokenId] = { bid, ask, mid: (bid+ask)/2, ts: Date.now() };
-    updateTickerWith(tokenId, (bid+ask)/2);
-    RENDER_DIRTY = true;
-  }
-
-  else if (et === 'price_change') {
-    // Price level change
-    (msg.price_changes || []).forEach(pc => {
-      const tokenId = pc.asset_id;
-      const price = parseFloat(pc.price || 0);
-      const bid = parseFloat(pc.best_bid || price);
-      const ask = parseFloat(pc.best_ask || price);
-      if (!tokenId || isNaN(price)) return;
-      TOKEN_PRICES[tokenId] = { bid, ask, mid: price, ts: Date.now() };
-      updateTickerWith(tokenId, price);
-      RENDER_DIRTY = true;
-    });
-  }
-
-  else if (et === 'book') {
-    // Full orderbook snapshot — extract best bid/ask
-    const tokenId = msg.asset_id;
-    if (!tokenId) return;
-    const bids = (msg.bids || []).map(b => parseFloat(b.price)).filter(Boolean).sort((a,b)=>b-a);
-    const asks = (msg.asks || []).map(a => parseFloat(a.price)).filter(Boolean).sort((a,b)=>a-b);
-    const bid = bids[0] || 0;
-    const ask = asks[0] || 0;
-    if (bid || ask) {
-      TOKEN_PRICES[tokenId] = { bid, ask, mid: (bid+ask)/2 || bid || ask, ts: Date.now() };
-      updateTickerWith(tokenId, TOKEN_PRICES[tokenId].mid);
-      RENDER_DIRTY = true;
+  sseSource.onmessage = (e) => {
+    if (!e.data || e.data.startsWith(':')) return;
+    try {
+      const msg = JSON.parse(e.data);
+      handleSSEMessage(msg);
+    } catch(err) {
+      log('SSE parse error: ' + err.message, 'err');
     }
+  };
+
+  sseSource.onerror = () => {
+    setWsPill('connecting', 'Reconnecting…');
+    log('SSE disconnected — reconnecting in 5s…', 'warn');
+    sseSource.close();
+    sseSource = null;
+    sseReconnectTimer = setTimeout(connectSSE, 5000);
+  };
+}
+
+function handleSSEMessage(msg) {
+  if (msg.type === 'connected') {
+    log('Server: ' + (msg.msg || 'connected'), 'ok');
+    return;
   }
 
-  else if (et === 'last_trade_price') {
-    // Last trade — good fallback price
-    const tokenId = msg.asset_id;
-    const price = parseFloat(msg.price || 0);
-    if (!tokenId || isNaN(price) || price === 0) return;
-    if (!TOKEN_PRICES[tokenId]) {
-      TOKEN_PRICES[tokenId] = { bid: price, ask: price, mid: price, ts: Date.now() };
-      RENDER_DIRTY = true;
-    } else if (Date.now() - (TOKEN_PRICES[tokenId].ts||0) > 30000) {
-      TOKEN_PRICES[tokenId] = { ...TOKEN_PRICES[tokenId], mid: price, ts: Date.now() };
-    }
+  if (msg.type === 'markets' && Array.isArray(msg.data)) {
+    log('Received ' + msg.data.length + ' markets from server', 'ok');
+    processMarkets(msg.data);
+    return;
   }
 
-  else if (et === 'new_market') {
-    // Auto-discover and subscribe to new markets
-    const tokens = msg.assets_ids || [];
-    const marketId = msg.id || msg.market;
-    if (!marketId || !tokens.length) return;
-    if (!MARKETS[marketId]) {
-      MARKETS[marketId] = {
-        id: marketId, question: msg.question || '—', cat: (msg.tags||['General'])[0]||'General',
-        tokenYes: tokens[0], tokenNo: tokens[1]||null,
-        assets_ids: tokens, outcomes: msg.outcomes||['Yes','No'],
-        prices: {}, bestBid: null, bestAsk: null
-      };
-      tokens.forEach(t => { TOKEN_TO_MARKET[t] = marketId; });
-      subscribeToMarket(msg);
-      document.getElementById('mScan').textContent = Object.keys(MARKETS).length;
-      log('New market discovered: ' + (msg.question||marketId).slice(0,50), 'ws');
-    }
+  if (msg.type === 'opportunities' && Array.isArray(msg.data)) {
+    log('Received ' + msg.data.length + ' arb opportunities', 'ok');
+    ALL_OPPS = msg.data;
+    OPP_MAP = {};
+    ALL_OPPS.forEach(o => { OPP_MAP[o.id] = o; });
+    document.getElementById('mScan').textContent = ALL_OPPS.length;
+    renderTable();
+    updateMetricsFromOpps();
+    return;
   }
 }
+
+function processMarkets(markets) {
+  ALL_OPPS = [];
+  for (const m of markets) {
+    try {
+      let prices = m.outcomePrices;
+      if (!prices) continue;
+      if (typeof prices === 'string') prices = JSON.parse(prices);
+      const nums = prices.map(Number).filter(n => !isNaN(n) && n > 0);
+      if (nums.length < 2) continue;
+      const total = nums.reduce((a,b)=>a+b,0);
+      const spread = parseFloat(((1-total)*100).toFixed(2));
+      if (Math.abs(spread) < 0.2) continue;
+
+      let outcomes = m.outcomes;
+      if (typeof outcomes === 'string') try { outcomes = JSON.parse(outcomes); } catch {}
+
+      ALL_OPPS.push({
+        id: m.id,
+        name: m.question || m.title || 'Market',
+        cat: m.category || 'General',
+        type: nums.length === 2 ? 'binary' : 'multi',
+        prices: nums,
+        outcomes: outcomes || ['Yes','No'],
+        spread: Math.abs(spread),
+        impliedTotal: parseFloat((total*100).toFixed(1)),
+        volume: parseFloat(m.volume||0),
+        slug: m.slug || m.id || '',
+        tokens: m.tokens || null,
+        liveData: true
+      });
+    } catch {}
+  }
+  ALL_OPPS.sort((a,b) => b.spread-a.spread);
+  OPP_MAP = {};
+  ALL_OPPS.forEach(o => { OPP_MAP[o.id] = o; });
+  document.getElementById('mScan').textContent = markets.length;
+  log('Processed ' + ALL_OPPS.length + ' arb opps from ' + markets.length + ' markets', 'ok');
+  renderTable();
+  updateMetricsFromOpps();
+  document.getElementById('scanTime').textContent = new Date().toLocaleTimeString();
+}
+
+function updateMetricsFromOpps() {
+  const above = ALL_OPPS.filter(o => o.spread >= MIN_SP);
+  document.getElementById('mOpps').textContent = above.length;
+  const sps = above.map(o=>o.spread);
+  document.getElementById('mBest').textContent = sps.length ? sps[0].toFixed(1)+'%' : '—';
+}
+
+// Keep these as no-ops for compatibility
+function connectWS() { connectSSE(); }
+function resubscribeAll() { connectSSE(); }
 
 // ══════════════════════════════════════════════════════════════
 // ARB DETECTION — runs every 500ms on dirty flag
@@ -997,7 +773,7 @@ function stopBot(reason) {
 let lastAutoTrade = 0;
 function autoTrade() {
   if (!BOT_RUNNING) return;
-  if (Date.now() - lastAutoTrade < 3000) return; // throttle: 1 trade per 3s max
+  if (Date.now() - lastAutoTrade < 5000) return;
 
   if (BALANCE <= SESSION_START * 0.5) {
     stopBot('AUTO-STOP: Balance $'+BALANCE.toFixed(2)+' ≤ 50% of start');
@@ -1005,10 +781,10 @@ function autoTrade() {
     return;
   }
 
-  const minSp = parseFloat(document.getElementById('cfgMinSp').value)||2;
-  const size  = parseFloat(document.getElementById('cfgSize').value)||100;
+  const minSp  = parseFloat(document.getElementById('cfgMinSp').value)||2;
+  const size   = parseFloat(document.getElementById('cfgSize').value)||100;
   const maxPos = parseInt(document.getElementById('cfgMaxPos').value)||3;
-  const eligible = ALL_OPPS.filter(o => o.spread >= minSp && o.type==='binary' && o.liveData);
+  const eligible = ALL_OPPS.filter(o => o.spread >= minSp && o.type !== 'cross');
   if (!eligible.length) return;
 
   lastAutoTrade = Date.now();
@@ -1314,18 +1090,14 @@ updateMetrics(); updateSLBar(); recalc();
 setMode('demo');
 
 // Load live markets from server FIRST, then connect WebSocket
-log('PolyARB Bot v4 — loading live market data…', 'ok');
-loadLiveTokens().then(() => {
-  // Start WebSocket after we have fresh token IDs
-  connectWS();
-  log('WebSocket connecting with ' + SEED_MARKETS.length + ' live markets', 'ws');
-}).catch(() => {
-  // Still connect WS even if token load failed
-  connectWS();
-});
+log('PolyARB Bot v4 — SSE edition. Connecting to cloud proxy…', 'ok');
+log('Server: ' + window.location.host, 'info');
 
-// Run arb detection loop every 500ms
-setInterval(detectArb, 500);
+// Connect SSE stream for live data
+connectSSE();
+
+// Auto-trade check every 3s
+setInterval(() => { if (BOT_RUNNING) autoTrade(); }, 3000);
 </script>
 </body>
 </html>
